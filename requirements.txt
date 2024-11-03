@@ -1,0 +1,13 @@
+fastapi
+uvicorn
+python-multipart
+boto3
+google-cloud-speech
+google-cloud-texttospeech
+python-dotenv
+requests
+websockets
+opencv-python-headless
+numpy
+ffmpeg
+aiohttp
