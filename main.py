@@ -14,7 +14,6 @@ from google.cloud import speech
 from google.cloud import texttospeech
 import requests
 from dotenv import load_dotenv
-from pydantic import BaseModel
 
 # Load environment variables
 load_dotenv()
@@ -51,6 +50,19 @@ def setup_google_credentials():
         logger.error(f"Failed to setup Google credentials: {e}")
         raise
 
+# Initialize FastAPI
+app = FastAPI()
+
+# アプリケーションの状態を保持
+app_state = {
+    "answers": {},
+    "current_progress": 0,
+    "generation_status": None,
+    "tts_client": None,
+    "speech_client": None,
+    "tts": None
+}
+
 # FastAPI initialization with lifespan
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -59,8 +71,14 @@ async def lifespan(app: FastAPI):
     try:
         credentials_path = setup_google_credentials()
         app.state.client_session = aiohttp.ClientSession()
-        app.state.tts_client = texttospeech.TextToSpeechClient()
-        app.state.speech_client = speech.SpeechClient()
+        
+        # Google Cloud Clientsの初期化
+        app_state["tts_client"] = texttospeech.TextToSpeechClient()
+        app_state["speech_client"] = speech.SpeechClient()
+        
+        # TTSの初期化
+        app_state["tts"] = TextToSpeech(app_state["tts_client"])
+        
         logger.info("Initialized application services")
         
         yield
@@ -83,8 +101,8 @@ app = FastAPI(lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
-        "http://localhost:3000",  # 開発環境用
-        "https://your-song-creator-web.onrender.com"  # 本番環境のフロントエンドURL
+        "http://localhost:3000",
+        "https://your-song-creator-web.onrender.com"
     ],
     allow_credentials=True,
     allow_methods=["*"],
@@ -108,8 +126,8 @@ app_state = {
 }
 
 class TextToSpeech:
-    def __init__(self):
-        self.client = texttospeech.TextToSpeechClient()
+    def __init__(self, client):
+        self.client = client
         self.voice = texttospeech.VoiceSelectionParams(
             language_code="ja-JP",
             name="ja-JP-Neural2-B",
@@ -134,6 +152,7 @@ class TextToSpeech:
             return base64.b64encode(response.audio_content).decode()
         except Exception as e:
             logger.error(f"Speech synthesis error: {str(e)}")
+            logger.exception(e)
             raise
 
 # TTSインスタンスを作成
@@ -152,12 +171,18 @@ class AnswerSubmission(BaseModel):
 class MusicGeneration(BaseModel):
     answers: List[str]
 
-# エンドポイント：インタビュー開始
+# エンドポイント: インタビュー開始
 @app.post("/start-interview")
 async def start_interview():
     try:
+        if not app_state["tts"]:
+            raise HTTPException(
+                status_code=500,
+                detail="Text-to-Speech service not initialized"
+            )
+
         greeting = "こんにちは！青春ソングを作るためのインタビューを始めましょう。各質問に一言で答えてください。"
-        audio_base64 = await tts.synthesize_speech(greeting)
+        audio_base64 = await app_state["tts"].synthesize_speech(greeting)
         
         # 状態をリセット
         app_state["answers"] = {}
@@ -170,6 +195,7 @@ async def start_interview():
         }
     except Exception as e:
         logger.error(f"Error in start_interview: {str(e)}")
+        logger.exception(e)
         raise HTTPException(status_code=500, detail=str(e))
     
 # エンドポイント：質問を取得
