@@ -5,15 +5,16 @@ import asyncio
 import tempfile
 import aiohttp
 import base64
+from typing import List, Optional
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, UploadFile, File, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 import logging
 from google.cloud import speech
 from google.cloud import texttospeech
 import requests
 from dotenv import load_dotenv
-from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 
 # Load environment variables
 load_dotenv()
@@ -88,10 +89,9 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
-    expose_headers=["*"],  # WebSocket用に追加
 )
 
-# Interview questions
+# 質問リスト
 QUESTIONS = [
     "あなたの青春時代を一言で表すと？",
     "その時期にあなたが最も夢中になっていたものは？",
@@ -100,12 +100,16 @@ QUESTIONS = [
     "今、あの頃の自分に伝えたい言葉を一つ挙げるとしたら？"
 ]
 
-# Store answers
-answers = {}
+# グローバルな状態管理用の辞書
+app_state = {
+    "answers": {},
+    "current_progress": 0,
+    "generation_status": None
+}
 
 class TextToSpeech:
     def __init__(self):
-        self.client = app.state.tts_client
+        self.client = texttospeech.TextToSpeechClient()
         self.voice = texttospeech.VoiceSelectionParams(
             language_code="ja-JP",
             name="ja-JP-Neural2-B",
@@ -132,11 +136,73 @@ class TextToSpeech:
             logger.error(f"Speech synthesis error: {str(e)}")
             raise
 
-# Create TTS instance after the app starts
+# TTSインスタンスを作成
+tts = None
+
 @app.on_event("startup")
 async def startup_event():
-    app.state.tts = TextToSpeech()
+    global tts
+    tts = TextToSpeech()
 
+# Pydanticモデル
+class AnswerSubmission(BaseModel):
+    answer: str
+    questionIndex: int
+
+class MusicGeneration(BaseModel):
+    answers: List[str]
+
+# エンドポイント：インタビュー開始
+@app.post("/start-interview")
+async def start_interview():
+    try:
+        greeting = "こんにちは！青春ソングを作るためのインタビューを始めましょう。各質問に一言で答えてください。"
+        audio_base64 = await tts.synthesize_speech(greeting)
+        
+        # 状態をリセット
+        app_state["answers"] = {}
+        app_state["current_progress"] = 0
+        app_state["generation_status"] = None
+        
+        return {
+            "text": greeting,
+            "audio": audio_base64
+        }
+    except Exception as e:
+        logger.error(f"Error in start_interview: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+    
+# エンドポイント：質問を取得
+@app.post("/get-question")
+async def get_question(data: dict):
+    try:
+        index = data.get("index", 0)
+        if index < 0 or index >= len(QUESTIONS):
+            raise HTTPException(status_code=400, detail="Invalid question index")
+
+        question = QUESTIONS[index]
+        audio_base64 = await tts.synthesize_speech(question)
+        
+        return {
+            "text": question,
+            "audio": audio_base64
+        }
+    except Exception as e:
+        logger.error(f"Error in get_question: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+# エンドポイント：回答を送信
+@app.post("/submit-answer")
+async def submit_answer(data: AnswerSubmission):
+    try:
+        # 回答を保存
+        app_state["answers"][data.questionIndex] = data.answer
+        return {"status": "success"}
+    except Exception as e:
+        logger.error(f"Error in submit_answer: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+# エンドポイント：音声認識
 @app.post("/transcribe")
 async def transcribe_audio(file: UploadFile = File(...)):
     try:
@@ -171,248 +237,139 @@ async def transcribe_audio(file: UploadFile = File(...)):
             except Exception as e:
                 logger.error(f"Failed to delete temp file: {e}")
 
-async def generate_music(themes: list[str], websocket: WebSocket) -> dict:
-    """Generate music using Suno AI while maintaining WebSocket connection"""
-    suno_api_url = "https://api.goapi.ai/api/suno/v1/music"
-    
-    headers = {
-        "X-API-Key": os.getenv('SUNO_API_KEY'),
-        "Content-Type": "application/json"
-    }
-    
-    themes_text = " ".join(themes)
-    description = (
-        f"Create a nostalgic J-pop song about {themes_text}. "
-    )
-    
-    if len(description) > 200:
-        max_themes_length = 100
-        if len(themes_text) > max_themes_length:
-            themes_text = themes_text[:max_themes_length] + "..."
-            description = f"Create a nostalgic J-pop song about {themes_text}. Female JP vocal."
-    
-    logger.info(f"Generating music with prompt: {description}")
-    
-    payload = {
-        "custom_mode": False,
-        "mv": "chirp-v3-5",
-        "input": {
-            "gpt_description_prompt": description,
-            "make_instrumental": False,
-            "voice": "female",
-            "style": "j-pop",
-            "temperature": 0.1,
-            "top_k": 5,
-            "top_p": 0.3,
-            "voice_settings": {
-                "gender": "female",
-                "language": "japanese",
-                "style": "clear",
-                "variation": "single"
+# 楽曲生成の実処理
+async def generate_music_with_suno(themes: List[str]) -> dict:
+    """Generate music using Suno AI"""
+    try:
+        suno_api_url = "https://api.goapi.ai/api/suno/v1/music"
+        
+        headers = {
+            "X-API-Key": os.getenv('SUNO_API_KEY'),
+            "Content-Type": "application/json"
+        }
+        
+        themes_text = " ".join(themes)
+        description = (
+            f"Create a nostalgic J-pop song about {themes_text}. "
+        )
+        
+        if len(description) > 200:
+            max_themes_length = 100
+            if len(themes_text) > max_themes_length:
+                themes_text = themes_text[:max_themes_length] + "..."
+                description = f"Create a nostalgic J-pop song about {themes_text}. Female JP vocal."
+        
+        logger.info(f"Generating music with prompt: {description}")
+        
+        payload = {
+            "custom_mode": False,
+            "mv": "chirp-v3-5",
+            "input": {
+                "gpt_description_prompt": description,
+                "make_instrumental": False,
+                "voice": "female",
+                "style": "j-pop",
+                "temperature": 0.1,
+                "top_k": 5,
+                "top_p": 0.3,
+                "voice_settings": {
+                    "gender": "female",
+                    "language": "japanese",
+                    "style": "clear",
+                    "variation": "single"
+                }
             }
         }
-    }
-    
-    try:
+
         # タスク作成
         async with app.state.client_session.post(suno_api_url, headers=headers, json=payload) as response:
             if response.status != 200:
                 error_text = await response.text()
                 logger.error(f"Suno API Error: Status {response.status}")
                 logger.error(f"Response: {error_text}")
-                raise ValueError(f"Suno API Error: {error_text}")
+                raise HTTPException(status_code=response.status, detail=f"Suno API Error: {error_text}")
             
             task_data = await response.json()
             task_id = task_data['data']['task_id']
             logger.info(f"Task ID: {task_id}")
-        
-        last_progress = -1
-        connection_check_counter = 0
-        
+
+        # 生成状態の確認
         while True:
-            try:
-                # WebSocket接続の維持確認
-                connection_check_counter += 1
-                if connection_check_counter >= 10:  # 約1秒ごとにkeep-alive
-                    await websocket.send_json({
-                        "type": "keep_alive"
-                    })
-                    connection_check_counter = 0
-
-                # 生成状態の確認
-                async with app.state.client_session.get(f"{suno_api_url}/{task_id}", headers=headers) as status_response:
-                    status_data = await status_response.json()
-                    
-                    if 'data' not in status_data:
-                        logger.error("Invalid response structure")
-                        raise ValueError("Invalid response format")
-
-                    status = status_data['data'].get('status')
-                    
-                    if status == 'completed':
-                        # 完了時の出力確認
-                        video_url = None
-                        
-                        # まずoutput内を確認
-                        if 'output' in status_data['data']:
-                            video_url = status_data['data']['output'].get('video_url')
-                        
-                        # 次にclipsを確認
-                        if not video_url and 'clips' in status_data['data']:
-                            clips = status_data['data']['clips']
-                            if clips and isinstance(clips, dict):
-                                first_clip = next(iter(clips.values()))
-                                video_url = first_clip.get('video_url')
-                        
-                        # 最後にdata直下を確認
-                        if not video_url:
-                            video_url = status_data['data'].get('video_url')
-
-                        if video_url:
-                            logger.info(f"Music generation completed with URL: {video_url}")
-                            return {"status": "success", "video_url": video_url}
-                        raise ValueError("No video URL found in completed response")
-
-                    elif status == 'failed':
-                        error_message = status_data['data'].get('error', 'Unknown error')
-                        logger.error(f"Generation failed: {error_message}")
-                        return {"status": "error", "error": error_message}
-
-                    elif status == 'processing':
-                        progress = status_data['data'].get('progress', 0)
-                        if progress != last_progress:
-                            logger.info(f"Progress: {progress}%")
-                            await websocket.send_json({
-                                "type": "generation_progress",
-                                "progress": progress
-                            })
-                            last_progress = progress
-
-                # 短い間隔でチェック
-                await asyncio.sleep(0.1)  # 100ミリ秒ごとにチェック
+            async with app.state.client_session.get(f"{suno_api_url}/{task_id}", headers=headers) as status_response:
+                status_data = await status_response.json()
                 
-            except (aiohttp.ClientError) as e:
-                logger.error(f"Network error: {e}")
-                await asyncio.sleep(5)
-                continue
-            except WebSocketDisconnect:
-                logger.error("WebSocket disconnected during generation")
-                raise
-            except Exception as e:
-                logger.error(f"Unexpected error: {e}")
-                return {"status": "error", "error": str(e)}
+                if 'data' not in status_data:
+                    logger.error("Invalid response structure")
+                    raise HTTPException(status_code=500, detail="Invalid response format")
+
+                status = status_data['data'].get('status')
+                
+                if status == 'completed':
+                    video_url = None
+                    if 'output' in status_data['data']:
+                        video_url = status_data['data']['output'].get('video_url')
+                    elif 'clips' in status_data['data']:
+                        clips = status_data['data']['clips']
+                        if clips and isinstance(clips, dict):
+                            first_clip = next(iter(clips.values()))
+                            video_url = first_clip.get('video_url')
+                    else:
+                        video_url = status_data['data'].get('video_url')
+
+                    if video_url:
+                        logger.info(f"Music generation completed with URL: {video_url}")
+                        return {"status": "success", "video_url": video_url}
+                    raise HTTPException(status_code=500, detail="No video URL found in completed response")
+
+                elif status == 'failed':
+                    error_message = status_data['data'].get('error', 'Unknown error')
+                    logger.error(f"Generation failed: {error_message}")
+                    raise HTTPException(status_code=500, detail=error_message)
+
+                elif status == 'processing':
+                    progress = status_data['data'].get('progress', 0)
+                    app_state["current_progress"] = progress
+                    logger.info(f"Generation progress: {progress}%")
+
+            await asyncio.sleep(3)  # 3秒待機してから次のチェック
             
     except Exception as e:
         logger.error(f"Error in music generation: {str(e)}")
-        return {"status": "error", "error": str(e)}
+        raise HTTPException(status_code=500, detail=str(e))
 
-async def estimate_audio_duration(text: str) -> float:
-    """
-    テキストの長さから音声の再生時間を概算する（日本語）
-    """
-    # 日本語の場合、1文字あたり約0.2秒として概算
-    base_duration = len(text) * 0.2
-    # 最低2秒、文末の余白として1秒を追加
-    return max(2.0, base_duration) + 1.0
-
-@app.websocket("/ws")
-async def websocket_endpoint(websocket: WebSocket):
+# エンドポイント：楽曲生成
+@app.post("/generate-music")
+async def generate_music(data: MusicGeneration):
     try:
-        await websocket.accept()
-        logger.info("WebSocket connected")
+        if not data.answers:
+            raise HTTPException(status_code=400, detail="No answers provided")
+
+        app_state["generation_status"] = "generating"
+        app_state["current_progress"] = 0
+
+        result = await generate_music_with_suno(data.answers)
         
-        # インタビューのみ1回実行
-        try:
-            # 開始メッセージを送信
-            greeting = "こんにちは！青春ソングを作るためのインタビューを始めましょう。各質問に一言で答えてください。"
-            audio_base64 = await app.state.tts.synthesize_speech(greeting)
-            greeting_duration = await estimate_audio_duration(greeting)
-            
-            await websocket.send_json({
-                "type": "speech",
-                "text": greeting,
-                "audio": audio_base64
-            })
-            
-            await asyncio.sleep(greeting_duration)
+        app_state["generation_status"] = "completed"
+        return result
 
-            # テーマを収集
-            themes = []
-            
-            # Questions and answers
-            for i, question in enumerate(QUESTIONS):
-                audio_base64 = await app.state.tts.synthesize_speech(question)
-                question_duration = await estimate_audio_duration(question)
-                
-                await websocket.send_json({
-                    "type": "speech",
-                    "text": question,
-                    "audio": audio_base64
-                })
-                
-                await asyncio.sleep(question_duration)
-                response = await websocket.receive_text()
-                themes.append(response)
-                await asyncio.sleep(0.5)
-
-            # 終了メッセージ
-            end_message = "ありがとうございます。ミュージックビデオの生成を開始します。"
-            audio_base64 = await app.state.tts.synthesize_speech(end_message)
-            await websocket.send_json({
-                "type": "speech",
-                "text": end_message,
-                "audio": audio_base64
-            })
-            
-            await asyncio.sleep(await estimate_audio_duration(end_message))
-            
-            # 楽曲生成開始通知
-            await websocket.send_json({
-                "type": "status_update",
-                "status": "generating_music"
-            })
-
-            # 楽曲生成
-            music_result = await generate_music(themes, websocket)
-            
-            if music_result.get("status") == "error":
-                await websocket.send_json({
-                    "type": "music_error",
-                    "data": music_result["error"]
-                })
-            elif music_result.get("status") == "success":
-                # 生成成功時は完了通知を送信
-                await websocket.send_json({
-                    "type": "music_complete",
-                    "data": {
-                        "video_url": music_result["video_url"]
-                    }
-                })
-            
-            # 処理完了後、明示的に接続を閉じる
-            await websocket.close(code=1000)
-            logger.info("Interview and music generation completed successfully")
-                
-        except WebSocketDisconnect:
-            logger.info("WebSocket disconnected during interview")
-            raise
-        except Exception as e:
-            logger.error(f"Error in interview process: {str(e)}")
-            await websocket.send_json({
-                "type": "error",
-                "message": "処理中にエラーが発生しました"
-            })
-            raise
-    except WebSocketDisconnect:
-        logger.info("WebSocket disconnected normally")
     except Exception as e:
-        logger.error(f"WebSocket error: {str(e)}")
-        try:
-            await websocket.send_json({
-                "type": "error",
-                "message": str(e)
-            })
-        except:
-            pass
-    finally:
-        logger.info("WebSocket connection closed")
+        app_state["generation_status"] = "failed"
+        logger.error(f"Error in generate_music: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+# エンドポイント：生成進捗状況を取得
+@app.get("/generation-progress")
+async def get_generation_progress():
+    try:
+        return {
+            "progress": app_state["current_progress"],
+            "status": app_state["generation_status"]
+        }
+    except Exception as e:
+        logger.error(f"Error in get_generation_progress: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+# メインの実行（開発環境用）
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
