@@ -13,6 +13,7 @@ from google.cloud import speech
 from google.cloud import texttospeech
 import requests
 from dotenv import load_dotenv
+from fastapi.middleware.cors import CORSMiddleware
 
 # Load environment variables
 load_dotenv()
@@ -82,11 +83,12 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=[
         "http://localhost:3000",  # 開発環境用
-        "https://your-song-creator-web.onrender.com"  # 本番環境用
+        "https://your-song-creator-web.onrender.com"  # 本番環境のフロントエンドURL
     ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["*"],  # WebSocket用に追加
 )
 
 # Interview questions
@@ -318,7 +320,7 @@ async def websocket_endpoint(websocket: WebSocket):
     try:
         await websocket.accept()
         logger.info("WebSocket connected")
-
+        
         # インタビューのみ1回実行
         try:
             # 開始メッセージを送信
@@ -401,7 +403,6 @@ async def websocket_endpoint(websocket: WebSocket):
                 "message": "処理中にエラーが発生しました"
             })
             raise
-            
     except WebSocketDisconnect:
         logger.info("WebSocket disconnected normally")
     except Exception as e:

@@ -5,3 +5,4 @@ google-cloud-texttospeech
 python-dotenv
 requests
 uvicorn
+aiohttp
