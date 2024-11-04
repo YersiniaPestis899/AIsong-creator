@@ -5,10 +5,11 @@ import asyncio
 import tempfile
 import aiohttp
 import base64
-from typing import List, Optional
+from typing import List, Optional, Dict
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 import logging
 from google.cloud import speech
 from google.cloud import texttospeech
@@ -25,6 +26,44 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Pydanticモデル
+class AnswerSubmission(BaseModel):
+    answer: str
+    questionIndex: int
+
+class MusicGeneration(BaseModel):
+    answers: List[str]
+
+class TextToSpeech:
+    def __init__(self, client):
+        self.client = client
+        self.voice = texttospeech.VoiceSelectionParams(
+            language_code="ja-JP",
+            name="ja-JP-Neural2-B",
+        )
+        self.audio_config = texttospeech.AudioConfig(
+            audio_encoding=texttospeech.AudioEncoding.MP3,
+            speaking_rate=1.0,
+            pitch=0.0
+        )
+
+    async def synthesize_speech(self, text: str) -> str:
+        """
+        テキストを音声に変換しBase64エンコードされた文字列を返す
+        """
+        try:
+            synthesis_input = texttospeech.SynthesisInput(text=text)
+            response = self.client.synthesize_speech(
+                input=synthesis_input,
+                voice=self.voice,
+                audio_config=self.audio_config
+            )
+            return base64.b64encode(response.audio_content).decode()
+        except Exception as e:
+            logger.error(f"Speech synthesis error: {str(e)}")
+            logger.exception(e)
+            raise
+
 def setup_google_credentials():
     """Setup Google Cloud credentials from base64 encoded string"""
     try:
@@ -32,15 +71,12 @@ def setup_google_credentials():
         if not encoded_credentials:
             raise ValueError("GOOGLE_CREDENTIALS_BASE64 environment variable is not set")
         
-        # デコードしてJSONを取得
         credentials_json = base64.b64decode(encoded_credentials).decode('utf-8')
         
-        # 一時ファイルを作成
         temp_file = tempfile.NamedTemporaryFile(delete=False)
         try:
             temp_file.write(credentials_json.encode())
             temp_file.flush()
-            # 環境変数を設定
             os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = temp_file.name
             return temp_file.name
         except Exception as e:
@@ -50,11 +86,8 @@ def setup_google_credentials():
         logger.error(f"Failed to setup Google credentials: {e}")
         raise
 
-# Initialize FastAPI
-app = FastAPI()
-
 # アプリケーションの状態を保持
-app_state = {
+app_state: Dict = {
     "answers": {},
     "current_progress": 0,
     "generation_status": None,
@@ -118,60 +151,7 @@ QUESTIONS = [
     "今、あの頃の自分に伝えたい言葉を一つ挙げるとしたら？"
 ]
 
-# グローバルな状態管理用の辞書
-app_state = {
-    "answers": {},
-    "current_progress": 0,
-    "generation_status": None
-}
-
-class TextToSpeech:
-    def __init__(self, client):
-        self.client = client
-        self.voice = texttospeech.VoiceSelectionParams(
-            language_code="ja-JP",
-            name="ja-JP-Neural2-B",
-        )
-        self.audio_config = texttospeech.AudioConfig(
-            audio_encoding=texttospeech.AudioEncoding.MP3,
-            speaking_rate=1.0,
-            pitch=0.0
-        )
-
-    async def synthesize_speech(self, text: str) -> str:
-        """
-        テキストを音声に変換しBase64エンコードされた文字列を返す
-        """
-        try:
-            synthesis_input = texttospeech.SynthesisInput(text=text)
-            response = self.client.synthesize_speech(
-                input=synthesis_input,
-                voice=self.voice,
-                audio_config=self.audio_config
-            )
-            return base64.b64encode(response.audio_content).decode()
-        except Exception as e:
-            logger.error(f"Speech synthesis error: {str(e)}")
-            logger.exception(e)
-            raise
-
-# TTSインスタンスを作成
-tts = None
-
-@app.on_event("startup")
-async def startup_event():
-    global tts
-    tts = TextToSpeech()
-
-# Pydanticモデル
-class AnswerSubmission(BaseModel):
-    answer: str
-    questionIndex: int
-
-class MusicGeneration(BaseModel):
-    answers: List[str]
-
-# エンドポイント: インタビュー開始
+# エンドポイント：インタビュー開始
 @app.post("/start-interview")
 async def start_interview():
     try:
@@ -197,7 +177,7 @@ async def start_interview():
         logger.error(f"Error in start_interview: {str(e)}")
         logger.exception(e)
         raise HTTPException(status_code=500, detail=str(e))
-    
+
 # エンドポイント：質問を取得
 @app.post("/get-question")
 async def get_question(data: dict):
@@ -207,7 +187,7 @@ async def get_question(data: dict):
             raise HTTPException(status_code=400, detail="Invalid question index")
 
         question = QUESTIONS[index]
-        audio_base64 = await tts.synthesize_speech(question)
+        audio_base64 = await app_state["tts"].synthesize_speech(question)
         
         return {
             "text": question,
@@ -215,31 +195,38 @@ async def get_question(data: dict):
         }
     except Exception as e:
         logger.error(f"Error in get_question: {str(e)}")
+        logger.exception(e)
         raise HTTPException(status_code=500, detail=str(e))
-
+    
 # エンドポイント：回答を送信
 @app.post("/submit-answer")
 async def submit_answer(data: AnswerSubmission):
     try:
         # 回答を保存
         app_state["answers"][data.questionIndex] = data.answer
+        logger.info(f"Saved answer for question {data.questionIndex}: {data.answer}")
         return {"status": "success"}
     except Exception as e:
         logger.error(f"Error in submit_answer: {str(e)}")
+        logger.exception(e)
         raise HTTPException(status_code=500, detail=str(e))
 
 # エンドポイント：音声認識
 @app.post("/transcribe")
 async def transcribe_audio(file: UploadFile = File(...)):
+    temp_audio_path = None
     try:
+        # 一時ファイルに保存
         with tempfile.NamedTemporaryFile(delete=False, suffix=".webm") as temp_audio:
             temp_audio_path = temp_audio.name
             content = await file.read()
             temp_audio.write(content)
 
+        # 音声ファイルを読み込み
         with open(temp_audio_path, "rb") as audio_file:
             content = audio_file.read()
 
+        # 音声認識の設定
         audio = speech.RecognitionAudio(content=content)
         config = speech.RecognitionConfig(
             encoding=speech.RecognitionConfig.AudioEncoding.WEBM_OPUS,
@@ -247,16 +234,20 @@ async def transcribe_audio(file: UploadFile = File(...)):
             language_code="ja-JP",
         )
 
-        response = app.state.speech_client.recognize(config=config, audio=audio)
+        # 音声認識を実行
+        response = app_state["speech_client"].recognize(config=config, audio=audio)
         transcription = response.results[0].alternatives[0].transcript if response.results else ""
-
+        
+        logger.info(f"Transcribed text: {transcription}")
         return {"transcription": transcription}
 
     except Exception as e:
         logger.error(f"Transcription error: {str(e)}")
+        logger.exception(e)
         raise HTTPException(status_code=500, detail=str(e))
 
     finally:
+        # 一時ファイルの削除
         if temp_audio_path and os.path.exists(temp_audio_path):
             try:
                 os.unlink(temp_audio_path)
@@ -269,15 +260,15 @@ async def generate_music_with_suno(themes: List[str]) -> dict:
     try:
         suno_api_url = "https://api.goapi.ai/api/suno/v1/music"
         
+        # Suno APIの認証情報を設定
         headers = {
             "X-API-Key": os.getenv('SUNO_API_KEY'),
             "Content-Type": "application/json"
         }
         
+        # プロンプトの生成
         themes_text = " ".join(themes)
-        description = (
-            f"Create a nostalgic J-pop song about {themes_text}. "
-        )
+        description = f"Create a nostalgic J-pop song about {themes_text}. "
         
         if len(description) > 200:
             max_themes_length = 100
@@ -287,6 +278,7 @@ async def generate_music_with_suno(themes: List[str]) -> dict:
         
         logger.info(f"Generating music with prompt: {description}")
         
+        # APIリクエストの設定
         payload = {
             "custom_mode": False,
             "mv": "chirp-v3-5",
@@ -331,6 +323,7 @@ async def generate_music_with_suno(themes: List[str]) -> dict:
                 status = status_data['data'].get('status')
                 
                 if status == 'completed':
+                    # 生成完了時の処理
                     video_url = None
                     if 'output' in status_data['data']:
                         video_url = status_data['data']['output'].get('video_url')
@@ -361,6 +354,7 @@ async def generate_music_with_suno(themes: List[str]) -> dict:
             
     except Exception as e:
         logger.error(f"Error in music generation: {str(e)}")
+        logger.exception(e)
         raise HTTPException(status_code=500, detail=str(e))
 
 # エンドポイント：楽曲生成
@@ -370,17 +364,22 @@ async def generate_music(data: MusicGeneration):
         if not data.answers:
             raise HTTPException(status_code=400, detail="No answers provided")
 
+        # 生成状態の初期化
         app_state["generation_status"] = "generating"
         app_state["current_progress"] = 0
 
+        # 楽曲生成の実行
         result = await generate_music_with_suno(data.answers)
         
+        # 生成完了
         app_state["generation_status"] = "completed"
         return result
 
     except Exception as e:
+        # エラー発生時の処理
         app_state["generation_status"] = "failed"
         logger.error(f"Error in generate_music: {str(e)}")
+        logger.exception(e)
         raise HTTPException(status_code=500, detail=str(e))
 
 # エンドポイント：生成進捗状況を取得
@@ -393,6 +392,7 @@ async def get_generation_progress():
         }
     except Exception as e:
         logger.error(f"Error in get_generation_progress: {str(e)}")
+        logger.exception(e)
         raise HTTPException(status_code=500, detail=str(e))
 
 # メインの実行（開発環境用）
