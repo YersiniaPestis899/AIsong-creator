@@ -268,7 +268,7 @@ async def generate_music_with_suno(themes: List[str]) -> dict:
         
         # プロンプトの生成
         themes_text = " ".join(themes)
-        description = f"Create a nostalgic J-pop song about {themes_text}. "
+        description = f"Simple J-pop about {themes_text}. No repeats. Female JP vocal."
         
         if len(description) > 200:
             max_themes_length = 100
