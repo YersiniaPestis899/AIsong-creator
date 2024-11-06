@@ -274,7 +274,7 @@ async def generate_music_with_suno(themes: List[str]) -> dict:
             max_themes_length = 100
             if len(themes_text) > max_themes_length:
                 themes_text = themes_text[:max_themes_length] + "..."
-                description = f"Create a nostalgic J-pop song about {themes_text}. Female JP vocal."
+                description = f"Simple J-pop about {themes_text}. No repeats. Female JP vocal.."
         
         logger.info(f"Generating music with prompt: {description}")
         
