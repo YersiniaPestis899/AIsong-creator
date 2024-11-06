@@ -371,16 +371,41 @@ async def generate_music(data: MusicGeneration):
         # 楽曲生成の実行
         result = await generate_music_with_suno(data.answers)
         
+        # 生成完了のメッセージを音声合成
+        completion_message = "ミュージックビデオの生成が完了しました！ブラウザで視聴できます。"
+        completion_audio = await app_state["tts"].synthesize_speech(completion_message)
+        
         # 生成完了
         app_state["generation_status"] = "completed"
-        return result
+        
+        # URLと音声メッセージを返す
+        return {
+            "status": "success",
+            "video_url": result["video_url"],
+            "completion_message": {
+                "text": completion_message,
+                "audio": completion_audio
+            }
+        }
 
     except Exception as e:
         # エラー発生時の処理
         app_state["generation_status"] = "failed"
-        logger.error(f"Error in generate_music: {str(e)}")
-        logger.exception(e)
-        raise HTTPException(status_code=500, detail=str(e))
+        try:
+            # エラー時のメッセージも音声で通知
+            error_message = "申し訳ありません。楽曲の生成中にエラーが発生しました。"
+            error_audio = await app_state["tts"].synthesize_speech(error_message)
+            return {
+                "status": "error",
+                "error": str(e),
+                "error_message": {
+                    "text": error_message,
+                    "audio": error_audio
+                }
+            }
+        except Exception as audio_error:
+            logger.error(f"Error generating error audio: {str(audio_error)}")
+            raise HTTPException(status_code=500, detail=str(e))
 
 # エンドポイント：生成進捗状況を取得
 @app.get("/generation-progress")
